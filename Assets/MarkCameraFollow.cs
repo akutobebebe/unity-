@@ -11,9 +11,10 @@ public class MarkCameraFollow : MonoBehaviour
     {
         if (target == null) return;
 
-        Vector3 desired = target.position + new Vector3(0f, 2.2f, -5f);
+        bool followingPig = target.TryGetComponent(out PlayerMovement player) && player.IsPig;
+        Vector3 desired = target.position + new Vector3(0f, followingPig ? 1.2f : 2.2f, -5f);
         transform.position = Vector3.Lerp(transform.position, desired,
             1f - Mathf.Exp(-7f * Time.deltaTime));
-        transform.LookAt(target.position + new Vector3(0f, 0.35f, 0f));
+        transform.LookAt(target.position + new Vector3(0f, followingPig ? -0.4f : 0.35f, 0f));
     }
 }

@@ -1,5 +1,4 @@
 using System;
-using System.IO;
 using System.Linq;
 using UnityEditor;
 using UnityEditor.Animations;
@@ -11,6 +10,7 @@ using UnityEngine.SceneManagement;
 [InitializeOnLoad]
 public static class MarkCharacterBuilder
 {
+    private static bool installing;
     private const string ScenePath = "Assets/Scenes/SampleScene.unity";
     private const string ModelPath = "Assets/MGB/Model/Mark.fbx";
     private const string ControllerPath = "Assets/MGB/Model/Mark.controller";
@@ -48,13 +48,36 @@ public static class MarkCharacterBuilder
 
     private static void Install(bool force)
     {
+        if (installing) return;
+        installing = true;
+        try { InstallCore(force); }
+        finally { installing = false; }
+    }
+
+    private static void InstallCore(bool force)
+    {
         if (EditorApplication.isPlayingOrWillChangePlaymode) return;
         Scene scene = SceneManager.GetActiveScene();
         if (scene.path != ScenePath) return;
 
-        GameObject mark = GameObject.Find("Mark");
+        GameObject mark = scene.GetRootGameObjects().FirstOrDefault(g =>
+            g.name == "Mark" && g.GetComponent<PlayerMovement>() != null);
         GameObject model = AssetDatabase.LoadAssetAtPath<GameObject>(ModelPath);
         if (mark == null || model == null) return;
+
+        bool removedDuplicate = false;
+        foreach (Transform child in mark.transform.Cast<Transform>().ToArray())
+        {
+            if (child.name != "Mark" || !PrefabUtility.IsPartOfPrefabInstance(child.gameObject))
+                continue;
+            UnityEngine.Object.DestroyImmediate(child.gameObject);
+            removedDuplicate = true;
+        }
+        if (removedDuplicate)
+        {
+            EditorSceneManager.MarkSceneDirty(scene);
+            EditorSceneManager.SaveScene(scene);
+        }
 
         Transform existing = mark.transform.Find("MarkVisual");
         if (!force && existing != null && existing.GetComponentInChildren<Animator>() != null)
@@ -66,15 +89,8 @@ public static class MarkCharacterBuilder
             .ToArray();
         AnimationClip idle = FindClip(clips, "Idle");
         AnimationClip walk = FindClip(clips, "Walk");
-        if (idle == null || walk == null)
-        {
-            Debug.LogError("MGB: Mark.fbx must contain Idle and Walk clips. Found: " +
-                string.Join(", ", clips.Select(c => c.name)));
-            return;
-        }
-
-        AnimatorController controller = BuildController(idle, walk);
-        if (controller == null) return;
+        AnimatorController controller = idle != null && walk != null
+            ? BuildController(idle, walk) : null;
 
         // Keep the old visual until the real model and animations are ready.
         GameObject instance = (GameObject)PrefabUtility.InstantiatePrefab(model, scene);
@@ -112,7 +128,9 @@ public static class MarkCharacterBuilder
         EditorUtility.SetDirty(instance);
         EditorSceneManager.MarkSceneDirty(scene);
         EditorSceneManager.SaveScene(scene);
-        Debug.Log("MGB: Rigged Mark installed with Idle/Walk animation and URP materials.");
+        Debug.Log(controller == null
+            ? "MGB: Rigged Mark installed with textured materials and procedural walking."
+            : "MGB: Rigged Mark installed with Idle/Walk animation and URP materials.");
     }
 
     private static AnimationClip FindClip(AnimationClip[] clips, string name)
@@ -174,27 +192,65 @@ public static class MarkCharacterBuilder
                 if (material == null)
                 {
                     material = new Material(shader) { name = source.name };
-                    Color color = source.HasProperty("_BaseColor") ? source.GetColor("_BaseColor") :
-                        source.HasProperty("_Color") ? source.GetColor("_Color") : Color.white;
-                    material.SetColor("_BaseColor", color);
-                    Texture texture = source.mainTexture;
-                    if (texture != null) material.SetTexture("_BaseMap", texture);
-                    string lower = source.name.ToLowerInvariant();
-                    if (lower.Contains("hair") || lower.Contains("lash") || lower.Contains("brow"))
-                    {
-                        material.SetFloat("_AlphaClip", 1f);
-                        material.SetFloat("_Cutoff", 0.25f);
-                        material.EnableKeyword("_ALPHATEST_ON");
-                        material.SetFloat("_Cull", 0f);
-                        material.renderQueue = (int)UnityEngine.Rendering.RenderQueue.AlphaTest;
-                    }
                     AssetDatabase.CreateAsset(material, path);
                 }
+                Color color = source.HasProperty("_BaseColor") ? source.GetColor("_BaseColor") :
+                    source.HasProperty("_Color") ? source.GetColor("_Color") : Color.white;
+                string lower = source.name.ToLowerInvariant();
+                if (lower == "hair") ColorUtility.TryParseHtmlString("#48352A", out color);
+                if (lower.Contains("uniform shirt")) ColorUtility.TryParseHtmlString("#292929", out color);
+                if (lower.Contains("buttons")) ColorUtility.TryParseHtmlString("#111111", out color);
+                if (lower.Contains("jeans")) ColorUtility.TryParseHtmlString("#55585B", out color);
+                material.SetColor("_BaseColor", color);
+                Texture texture = GetTexture(source.name, false);
+                if (texture == null && lower != "hair") texture = source.mainTexture;
+                if (lower.Contains("uniform shirt") || lower.Contains("jeans")) texture = null;
+                material.SetTexture("_BaseMap", texture);
+                Texture normal = GetTexture(source.name, true);
+                if (lower.Contains("uniform shirt") || lower.Contains("jeans")) normal = null;
+                material.SetTexture("_BumpMap", normal);
+                if (normal != null) material.EnableKeyword("_NORMALMAP");
+                else material.DisableKeyword("_NORMALMAP");
+                bool transparent = lower.Contains("skin details") ||
+                    lower.Contains("lash") || lower.Contains("brow");
+                material.SetFloat("_AlphaClip", 0f);
+                material.SetFloat("_Surface", transparent ? 1f : 0f);
+                material.SetFloat("_Blend", 0f);
+                material.SetFloat("_ZWrite", transparent ? 0f : 1f);
+                material.SetFloat("_Cull", lower == "hair" ? 0f : 2f);
+                material.SetFloat("_Smoothness", lower == "hair" ? 0.18f : 0.35f);
+                material.DisableKeyword("_ALPHATEST_ON");
+                if (transparent) material.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+                else material.DisableKeyword("_SURFACE_TYPE_TRANSPARENT");
+                material.SetOverrideTag("RenderType", transparent ? "Transparent" : "Opaque");
+                material.renderQueue = transparent
+                    ? (int)UnityEngine.Rendering.RenderQueue.Transparent
+                    : (int)UnityEngine.Rendering.RenderQueue.Geometry;
+                EditorUtility.SetDirty(material);
                 assigned[i] = material;
             }
             renderer.sharedMaterials = assigned;
             EditorUtility.SetDirty(renderer);
         }
         AssetDatabase.SaveAssets();
+    }
+
+    private static Texture GetTexture(string materialName, bool normal)
+    {
+        string lower = materialName.ToLowerInvariant();
+        string file = null;
+        if (lower.Contains("skin details")) file = normal ? null : "look_15k5c1j.png";
+        else if (lower.Contains("skin")) file = normal ? null : "skin_young_caucasian_male2.jpg";
+        else if (lower.Contains("eyebrow")) file = normal ? null : "eyebrows_eyebrow001.png";
+        else if (lower.Contains("eyelash")) file = normal ? null : "eyelashes_eyelashes01.png";
+        else if (lower.Contains("eyes")) file = normal ? null : "eyes_grey.png";
+        else if (lower.Contains("teeth")) file = normal ? null : "teeth_teeth_base.png";
+        else if (lower.Contains("tongue")) file = normal ? null : "tongue_tongue01.jpg";
+        else if (lower.Contains("jeans legs")) file = normal ? "gen_14zfe7w_n.png" : "gen_14zfe7w.png";
+        else if (lower.Contains("baggy jeans")) file = normal ? "gen_ye6bh6_n.png" : "gen_ye6bh6.png";
+        else if (lower.Contains("uniform shirt")) file = normal ? "gen_rlv3fi_n.png" : "gen_rlv3fi.png";
+        else if (lower.Contains("sneaker leather")) file = normal ? "gen_1ilymrh_n.png" : "gen_1ilymrh.png";
+        return file == null ? null : AssetDatabase.LoadAssetAtPath<Texture>(
+            "Assets/MGB/Model/Textures/" + file);
     }
 }
